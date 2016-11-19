@@ -9,7 +9,7 @@ RUN apt-get update -qq && apt-get install -y wget &&\
 	    python-dev &&\
 	mkdir -p /usr/local/share/GeoIP &&\
 	wget -qO - http://geolite.maxmind.com/download/geoip/database/GeoLite2-City.mmdb.gz | gunzip - > /usr/local/share/GeoIP/GeoLite2-City.mmdb &&\
-	wget -qO https://github.com/maxmind/libmaxminddb/releases/download/1.2.0/libmaxminddb-1.2.0.tar.gz > libmaxminddb-1.2.0.tar.gz &&\
+	wget -qO - https://github.com/maxmind/libmaxminddb/releases/download/1.2.0/libmaxminddb-1.2.0.tar.gz > libmaxminddb-1.2.0.tar.gz &&\
 	tar xzvf libmaxminddb-1.2.0.tar.gz && cd libmaxminddb-1.2.0 && ./configure && make && make install &&\
 	pip install --upgrade ujson \
 		elasticsearch \
