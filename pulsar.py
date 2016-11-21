@@ -15,16 +15,29 @@ from elasticsearch.client import ClusterClient, IndicesClient
 from elasticsearch.helpers import parallel_bulk
 
 class Indexer:
-	def __init__(self, host, queue, port=9200):
+	INDEX_PREFIX = "pulsar"
+	def __init__(self, conf, queue):
+		self.conf = conf
+		host = self.conf.get("host", "es")
+		port = self.conf.get("port", 9200)
 		self.log = logging.getLogger("pulsar.indexer")
 		logging.getLogger("elasticsearch").setLevel(logging.INFO)
+		self.log.debug("port: %r" % port)
 		self.es = Elasticsearch([{"host": host, "port": port}])
 		self.cluster_client = ClusterClient(self.es)
 		health = self.cluster_client.health()
 		if not health or health.get("number_of_nodes") < 1:
 			raise Exception("No Elasticsearch nodes found: %r" % health)
+		# Put our template
+		self.indices_client = IndicesClient(self.es)
+		self.index_prefix = self.conf.get("index_prefix", self.INDEX_PREFIX)
+		self.indices_client.put_template(
+			name=self.index_prefix,
+			body=open("conf/es-template.json").read()
+		)
+		self.log.info("Put template to ES for pulsar indexes")
 		self.last_event_time = time()
-		self.index_prefix = "pulsar-"
+		self.index_prefix = self.index_prefix + "-"
 		self.index_name = self.get_index_name()
 		self.queue = queue
 		self.counter = 0
@@ -140,8 +153,8 @@ class Distributor:
 		self.log.info("Starting up as user %s" % getpass.getuser())
 		self.conf = conf
 		
-		def spawn_indexer(host, queue, port):
-			es = Indexer(host, queue, port)
+		def spawn_indexer(conf, queue):
+			es = Indexer(conf, queue)
 
 		def spawn_archiver(conf, queue):
 			try:
@@ -157,7 +170,7 @@ class Distributor:
 
 		self.destinations.append({ "queue": Queue() })
 		self.destinations[-1]["proc"] = Process(target=spawn_indexer, 
-			args=(conf["host"], self.destinations[-1]["queue"], conf.get("port", 9200)))
+			args=(conf, self.destinations[-1]["queue"]))
 
 		self.decorator = Decorator()
 
@@ -283,10 +296,10 @@ if __name__ == "__main__":
 	if len(sys.argv) > 0:
 		config = json.load(open(sys.argv[1]))
 
-	if os.environ.has_key("ES_HOST"):
-		config["host"] = os.environ["ES_HOST"]
-	if os.environ.has_key("ES_PORT"):
-		config["port"] = os.environ["ES_PORT"]
+	if os.environ.has_key("PULSAR_ES_HOST"):
+		config["host"] = os.environ["PULSAR_ES_HOST"]
+	if os.environ.has_key("PULSAR_ES_PORT"):
+		config["port"] = os.environ["PULSAR_ES_PORT"]
 	if os.environ.has_key("DEBUG"):
 		config["log_level"] = "DEBUG"
 
