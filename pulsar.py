@@ -8,11 +8,36 @@ import uuid
 from time import time
 from multiprocessing import Queue, Process
 import getpass
+import socket
+import struct
 
+import requests
 import ujson as json
 from elasticsearch import Elasticsearch
 from elasticsearch.client import ClusterClient, IndicesClient
 from elasticsearch.helpers import parallel_bulk
+
+sys.path.insert(1, sys.path[0] + "/lib")
+from ip2asn import IP2ASN
+
+RFC1918_10_START = struct.unpack("!I", socket.inet_aton("10.0.0.0"))
+RFC1918_10_END = struct.unpack("!I", socket.inet_aton("10.255.255.255"))
+RFC1918_192_START = struct.unpack("!I", socket.inet_aton("192.168.0.0"))
+RFC1918_192_END = struct.unpack("!I", socket.inet_aton("192.168.255.255"))
+RFC1918_172_START = struct.unpack("!I", socket.inet_aton("172.16.0.0"))
+RFC1918_172_END = struct.unpack("!I", socket.inet_aton("172.31.255.255"))
+RFC1918_169_START = struct.unpack("!I", socket.inet_aton("169.254.0.0"))
+RFC1918_169_END = struct.unpack("!I", socket.inet_aton("169.254.255.255"))
+RFC1918_127_START = struct.unpack("!I", socket.inet_aton("127.0.0.0"))
+RFC1918_127_END = struct.unpack("!I", socket.inet_aton("127.255.255.255"))
+
+def rfc1918(ipint):
+	if (ipint >= RFC1918_10_START and ipint <= RFC1918_10_END) or\
+		(ipint >= RFC1918_192_START and ipint <= RFC1918_192_END) or\
+		(ipint >= RFC1918_172_START and ipint <= RFC1918_172_END) or\
+		(ipint >= RFC1918_169_START and ipint <= RFC1918_169_END) or\
+		(ipint >= RFC1918_127_START and ipint <= RFC1918_127_END):
+		return True
 
 class Indexer:
 	INDEX_PREFIX = "pulsar"
@@ -163,17 +188,17 @@ class Distributor:
 				self.log.exception("Error starting archiver", exc_info=e)
 
 		self.destinations = []
+		if not conf.has_key("passthrough"):
+			self.destinations.append({ "queue": Queue() })
+			self.destinations[-1]["proc"] = Process(target=spawn_archiver, 
+				args=(conf, self.destinations[-1]["queue"]))
 
-		self.destinations.append({ "queue": Queue() })
-		self.destinations[-1]["proc"] = Process(target=spawn_archiver, 
-			args=(conf, self.destinations[-1]["queue"]))
+			self.destinations.append({ "queue": Queue() })
+			self.destinations[-1]["proc"] = Process(target=spawn_indexer, 
+				args=(conf, self.destinations[-1]["queue"]))
 
-		self.destinations.append({ "queue": Queue() })
-		self.destinations[-1]["proc"] = Process(target=spawn_indexer, 
-			args=(conf, self.destinations[-1]["queue"]))
-
-		self.decorator = Decorator()
-
+		self.decorator = Decorator(conf)
+		
 	def read(self, fh):
 		for d in self.destinations:
 			d["proc"].start()
@@ -184,33 +209,49 @@ class Distributor:
 				line = self.decorator.decorate(line)
 				line = json.dumps(line)
 			except Exception as e:
-				self.log.exception("Invalid JSON: %s" % (line), exc_info=e)
+				self.log.exception("Error processing line: %s" % (line), exc_info=e)
 				continue
-			for d in self.destinations:
-				d["queue"].put(line)
+			if self.destinations:
+				for d in self.destinations:
+					d["queue"].put(line)
+			else:
+				print json.dumps(line)
 
-		for d in self.destinations:
-			d["queue"].put("STOP")
-			d["proc"].join()
+		if self.destinations:
+			for d in self.destinations:
+				d["queue"].put("STOP")
+				d["proc"].join()
 
 class Decorator:
 	def __init__(self, conf={}):
+		self.conf = conf
 		self.ignore_list = set(["@timestamp", "HOST", "HOST_FROM", "SOURCE", "MESSAGE", "LEGACY_MSGHDR", "PROGRAM", "FILENAME"])
 		self.ip_field_list = set(["srcip", "dstip", "ip"])
 		self.log = logging.getLogger("pulsar.decorator")
 		self.id = uuid.uuid4()
 		self.counter = 0
 
-		self.has_geoip = False
+		self.analyze_ips = False
+		self.geoip = False
 		self._geo_exc = Exception
 		try:
 			import geoip2.database
 			from geoip2.errors import AddressNotFoundError
 			self._geo_exc = AddressNotFoundError
-			self.has_geoip = True
 			self.geoip = geoip2.database.Reader(conf.get("geoip_db", "/usr/local/share/GeoIP/GeoLite2-City.mmdb"))
+			self.analyze_ips = True
 		except Exception as e:
 			self.log.info("Failed to import geoip2, not using geoip decoration")
+
+		self.stats = {}
+		self.stats_every = 1000
+		self.last_stat_time = time()
+		self.last_stat_counter = 0
+		if conf.has_key("ip2asn"):
+			self.ip2asn = IP2ASN(conf)
+			self.analyze_ips = True
+		self.analyze_ips = False
+			
 
 	def parse_timestamp(self, timestamp):
 		# TODO
@@ -219,8 +260,31 @@ class Decorator:
 
 		return time()
 
+	def log_stats(self):
+		time_since_last = time() - self.last_stat_time
+		lines_since_last = self.counter - self.last_stat_counter
+		ret = {
+			"overall_lines_processed": self.counter,
+			"lines_processed": lines_since_last,
+			"lines_per_second": lines_since_last / float(time_since_last)
+		}
+		if self.stats.has_key("ip2asn"):
+			ret["ip2asn"] = {
+				"lookups": self.stats["ip2asn"]["lookups"],
+				"db_time_taken": self.stats["ip2asn"]["lookup_time_taken"],
+				"avg_db_lookup_time": float(self.stats["ip2asn"]["lookup_time_taken"]) / (self.stats["ip2asn"]["lookups"] - self.stats["ip2asn"]["cache_hits"]),
+				"cache_hits": self.stats["ip2asn"]["cache_hits"],
+				"cache_hits_percentage": float(self.stats["ip2asn"]["cache_hits"]) / self.stats["ip2asn"]["lookups"]
+			}
+		
+		self.log.debug(json.dumps(ret))
+		self.last_stat_time = time()
+		self.last_stat_counter = self.counter
+
 	def decorate(self, doc):
 		self.counter += 1
+		if self.counter % self.stats_every == 0:
+			self.log_stats()
 		
 		# Handle timestamps
 		timestamp = doc.get("timestamp", doc.get("@timestamp", time()))
@@ -261,9 +325,15 @@ class Decorator:
 			k = k.lower()
 			ret[k] = v
 		
-			if self.has_geoip:
-				# Attach GeoIP to IP's
-				if k in self.ip_field_list:
+			if self.analyze_ips and k in self.ip_field_list:
+				ipint = struct.unpack("!I", socket.inet_aton(v))[0]
+				if rfc1918(ipint):
+					ret[k + "_geo"] = {
+						"description": "RFC1918"
+					}
+					continue
+				if self.geoip:
+					# Attach GeoIP to IP's
 					try:
 						geoinfo = self.geoip.city(v)
 						if geoinfo.country.iso_code != None:
@@ -281,6 +351,61 @@ class Decorator:
 					except self._geo_exc:
 						pass
 
+				if hasattr(self, "ip2asn"):
+					entry = self.ip2asn.lookup(ipint)
+					if entry:
+						# record = {
+						# 	"start": entry[0],
+						# 	"end": entry[1],
+						# 	"asn": entry[2],
+						# 	"description": entry[3]
+						# }
+						keyname = k + "_geo"
+						if not ret.has_key(keyname):
+							ret[keyname] = {}
+						ret[keyname]["description"] = entry["description"]
+						ret[keyname]["asn"] = entry["asn"]
+						
+
+						# if self.geoip:
+						# 	ret[k + "_geo"].update(entry)
+						# 	self.cache.append(entry)
+						# else:
+						# 	self.cache.append(entry)
+						# 	ret[k + "_geo"] = entry
+					
+				# if self.ip2asn:
+				# 	class_c = ipint - (ipint % 256)
+				# 	for i, entry in enumerate(self.ip2asn_cache):
+				# 		if ipint >= entry["start"] and ipint <= entry["end"]:
+				# 			ret[k + "_asn"] = entry
+				# 			# Move to top of cache
+				# 			self.ip2asn_cache.pop(i)
+				# 			self.ip2asn_cache.unshift(entry)
+				# 			break
+				# 	else:
+				# 		try:
+				# 			entry = self.ip2asn.execute("SELECT * FROM subnets " +\
+				# 				"WHERE class_c=? AND start <= ? AND ? <= end " +\
+				# 				"ORDER BY end-start ASC LIMIT 1", 
+				# 				(class_c, ipint, ipint)).fetchone()
+				# 			if entry:
+				# 				record = {
+				# 					"start": entry[1],
+				# 					"end": entry[2],
+				# 					"asn": entry[3],
+				# 					"description": self.ip2asn.execute("SELECT description " +\
+				# 						"FROM descriptions WHERE id=?", (entry[4],)).fetchone()
+				# 				}
+				# 				if self.geoip:
+				# 					ret[k + "_geo"].update(record)
+				# 					self.ip2asn_cache[ entry[1] ] = record
+				# 				else:
+				# 					ret[k + "_geo"] = self.ip2asn_cache[ entry[1] ] = record
+														
+				# 		except Exception as e:
+				# 			self.log.error("Unable to get IP from %s" % v, exc_info=e)
+
 		return ret
 
 
@@ -294,20 +419,24 @@ if __name__ == "__main__":
 	}
 	
 	if len(sys.argv) > 0:
-		config = json.load(open(sys.argv[1]))
+		config.update(json.load(open(sys.argv[1])))
 
 	if os.environ.has_key("PULSAR_ES_HOST"):
 		config["host"] = os.environ["PULSAR_ES_HOST"]
 	if os.environ.has_key("PULSAR_ES_PORT"):
 		config["port"] = os.environ["PULSAR_ES_PORT"]
 	if os.environ.has_key("DEBUG"):
+		config["debug"] = True
 		config["log_level"] = "DEBUG"
+	if os.environ.has_key("PASSTHROUGH"):
+		config["passthrough"] = True
 
 	log_options = {
 		"format": '%(asctime)s %(name)s %(levelname)s %(process)d %(message)s',
 		"level": getattr(logging, config["log_level"].upper())
 	}
-	if config.has_key("log_file"):
+	if config.has_key("log_file") and not config["log_file"] == "stdout":
+		print "setting option"
 		log_options["filename"] = config["log_file"]
 	logging.basicConfig(**log_options)
 
