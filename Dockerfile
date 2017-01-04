@@ -21,6 +21,8 @@ ADD conf/syslog-ng-3.5.conf /etc/syslog-ng/syslog-ng.conf
 ADD conf/pulsar.conf /etc/pulsar.conf
 ADD . /opt/pulsar
 
+WORKDIR /opt/pulsar
+
 EXPOSE 514
 EXPOSE 601
 EXPOSE 6514
